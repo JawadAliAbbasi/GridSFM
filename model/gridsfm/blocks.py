@@ -24,6 +24,19 @@ DEFAULT_INPUT_DIMS = {
     'cycle':     4,
 }
 
+# CoED (continuous edge directions) applies to the branch-endpoint incidence
+# only.  Those four relations carry the branch orientation as a hard +/-1 in
+# edge_attr[:, 0] (+1 for the "from" endpoint, -1 for the "to" endpoint; see
+# cycle_basis._promote_branch_nodes), which is exactly the discrete direction
+# CoED exists to relax.  The remaining signed relations (cycle <-> branch) carry
+# cycle-basis orientation, which is not an edge direction, so they are excluded.
+_COED_TYPES = {
+    ('bus',       'endpoint_of', 'branch_ac'),
+    ('branch_ac', 'endpoint_of', 'bus'),
+    ('bus',       'endpoint_of', 'branch_tr'),
+    ('branch_tr', 'endpoint_of', 'bus'),
+}
+
 _SIGNED_INCIDENCE_TYPES = {
     ('bus',         'endpoint_of', 'branch_ac'),
     ('branch_ac',   'endpoint_of', 'bus'),
@@ -87,6 +100,58 @@ def _slack_or_mean_anchor(data: HeteroData, x_bus: Tensor, n_graphs: int) -> Ten
 
 class _SAGEConvWithEdgeAttr(SAGEConv):
     """SAGEConv that accepts and ignores an `edge_attr` kwarg."""
+    def _coed_edge_weight(self, branch_nt: str, num_edges: int, device, dtype) -> Tensor:
+        """Per-edge multiplier for the signed branch-endpoint incidence.
+
+        Each branch node receives one message per endpoint bus, scaled by a hard
+        sign: +1 from its "from" bus, -1 from its "to" bus.  CoED relaxes that
+        hard direction into a learnable angle, weighting the two endpoints by
+
+            w_from = 2 cos^2(theta),   w_to = 2 sin^2(theta)
+
+        which sum to 2, so at theta = pi/4 both are exactly 1 and the layer
+        reduces to the unmodified signed incidence.  The factor 2 is what makes
+        that an exact no-op; without it every message would be halved at init.
+
+        Layout.  Within one graph the endpoint edges are contiguous,
+        ``[all from-endpoints, all to-endpoints]``.  PyG batches by
+        concatenating whole graphs, so for ``g`` graphs the per-graph pattern
+        REPEATS rather than the two halves staying globally contiguous:
+        ``[g1_from, g1_to, g2_from, g2_to, ...]``.  Hence ``.repeat(g)`` of the
+        single-graph vector, not ``repeat`` of each half.  Getting this backwards
+        binds theta to the wrong endpoints and raises nothing.
+        """
+        theta_raw = self.coed_theta_raw[branch_nt]
+        n_branch = theta_raw.numel()
+        if n_branch == 0:
+            return torch.ones(num_edges, 1, device=device, dtype=dtype)
+        if num_edges % (2 * n_branch) != 0:
+            raise ValueError(
+                f"CoED expects {2 * n_branch} endpoint edges per graph for "
+                f"{branch_nt} ({n_branch} branches x 2 endpoints), but the batch "
+                f"has {num_edges}, which is not a whole multiple. Either the "
+                f"topology is not fixed across samples or coed_branch_counts is "
+                f"wrong for this grid."
+            )
+        n_graphs = num_edges // (2 * n_branch)
+
+        # Written as 1 +/- cos(2*theta) rather than 2*cos^2 / 2*sin^2 -- the same
+        # quantity, but exact at the initialisation point.  Evaluating
+        # 2*cos(pi/4)**2 gives 0.99999994 in float32 and 1.0000000000000002 in
+        # float64, whereas cos(2*theta) at theta = pi/4 is ~6e-17 and 1 +/- it
+        # casts to exactly 1.0 in float32 -- the dtype the incidence sign is
+        # actually built in (cycle_basis makes side_sign float32).  So an
+        # untrained CoED run is bit-identical to the baseline, which is how we
+        # verify theta is wired up rather than silently inert.  In float64 the
+        # "to" weight lands one ulp low (1 - 1.1e-16); harmless, but it means the
+        # no-op is exact only at float32.  Computed in double, then cast.
+        theta = (torch.pi / 2.0) * torch.sigmoid(theta_raw.double())
+        cos2t = torch.cos(2.0 * theta)
+        w_from = 1.0 + cos2t
+        w_to = 1.0 - cos2t
+        w = torch.cat([w_from, w_to]).repeat(n_graphs)
+        return w.to(device=device, dtype=dtype).view(-1, 1)
+
     def forward(self, x, edge_index, edge_attr=None, **kwargs):
         return super().forward(x, edge_index, **kwargs)
 
@@ -176,8 +241,28 @@ class GridBlock(nn.Module):
         num_heads: int = 4,
         ffn_mult: int = 4,
         dropout: float = 0.0,
+        coed_branch_counts: Optional[Dict[str, int]] = None,
     ):
         super().__init__()
+        # --- CoED: one learnable angle per undirected branch, per block -------
+        # theta = (pi/2) * sigmoid(theta_raw) keeps the angle in [0, pi/2] by
+        # construction, so no clamping hook is needed, and theta_raw = 0 gives
+        # exactly theta = pi/4.  There the two endpoint weights are both 1 (see
+        # _coed_edge_weight), so an untrained CoED model is bit-identical to the
+        # baseline -- which is the check that CoED is wired up rather than inert.
+        #
+        # The parameter lives on the block, so each block learns its own angles.
+        # A single shared theta would apply the same directional prior at every
+        # block and compound with depth.
+        self.coed_branch_counts = dict(coed_branch_counts) if coed_branch_counts else None
+        if self.coed_branch_counts:
+            self.coed_theta_raw = nn.ParameterDict({
+                nt: nn.Parameter(torch.zeros(int(n)))
+                for nt, n in self.coed_branch_counts.items()
+            })
+        else:
+            self.coed_theta_raw = None
+
         self.attn_ln  = nn.ModuleDict({nt: nn.LayerNorm(hidden_dim) for nt in node_types})
         self.attn     = nn.ModuleDict({
             nt: LinearSelfAttention(hidden_dim, num_heads=num_heads, dropout=dropout)
@@ -231,6 +316,22 @@ class GridBlock(nn.Module):
         x_pre = {nt: self.gnn_ln[nt](x) for nt, x in x_dict.items() if nt in self.gnn_ln}
         if edge_attr_dict is None:
             edge_attr_dict = {}
+        if self.coed_theta_raw is not None:
+            # Fold the CoED weight into the sign column itself.  SignedIncidenceConv
+            # reads only edge_attr[:, 0:1], and HeteroConv already routes
+            # edge_attr_dict per relation, so no conv or propagate signature has
+            # to change.  Copy first: the caller's dict is reused by every block.
+            edge_attr_dict = dict(edge_attr_dict)
+            for et in _COED_TYPES:
+                ea = edge_attr_dict.get(et)
+                if ea is None or et not in edge_index_dict:
+                    continue
+                branch_nt = et[2] if et[0] == 'bus' else et[0]
+                if branch_nt not in self.coed_theta_raw:
+                    continue
+                edge_attr_dict[et] = ea * self._coed_edge_weight(
+                    branch_nt, ea.size(0), ea.device, ea.dtype,
+                )
         n_graphs_dict = {et: n_graphs for et in edge_index_dict}
         x_msg = self.gnn(x_pre, edge_index_dict,
                          edge_attr_dict=edge_attr_dict,

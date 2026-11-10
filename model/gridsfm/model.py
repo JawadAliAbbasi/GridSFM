@@ -66,12 +66,17 @@ class GridTransformerBackbone(nn.Module):
         hodge_pe_dim: int = 8,
         hodge_pe_steps: int = 4,
         theta_res_scale: float = 1.0,
+        coed_branch_counts: Optional[Dict[str, int]] = None,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_blocks = num_blocks
         self.leaky_alpha = float(leaky_alpha)
         self.theta_res_scale = float(theta_res_scale)
+        # NOTE: `theta` in this codebase means the bus voltage ANGLE (see the
+        # theta head and theta_res_scale).  CoED's edge angle is therefore always
+        # spelled `coed_theta` / `coed_theta_raw`, never `theta`.
+        self.coed_branch_counts = dict(coed_branch_counts) if coed_branch_counts else None
         self.NODE_TYPES = list(self.__class__.NODE_TYPES)
         self.EDGE_TYPES = list(self.__class__.EDGE_TYPES)
         self._dc_cache = DCPriorCache(max_cache=64)
@@ -117,6 +122,7 @@ class GridTransformerBackbone(nn.Module):
                 num_heads=num_heads,
                 ffn_mult=ffn_mult,
                 dropout=dropout,
+                coed_branch_counts=coed_branch_counts,
             )
             for _ in range(num_blocks)
         ])
